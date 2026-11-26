@@ -390,40 +390,51 @@ def trim_video_ffmpeg(
     end_sec: float,
     reencode: bool = True,
     ffmpeg_bin: Optional[str] = None,
+    progress_cb: Optional[Callable[[float], None]] = None,
 ) -> None:
-    """Trim video to [start_sec, end_sec] using ffmpeg."""
+    """Trim video to [start_sec, end_sec] using ffmpeg with live percentage progress."""
     exe = find_ffmpeg(ffmpeg_bin)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     duration = max(0.1, end_sec - start_sec)
 
+    base_cmd = [
+        exe,
+        "-y",
+        "-ss", f"{start_sec:.3f}",
+        "-i", input_path,
+        "-t", f"{duration:.3f}",
+    ]
     if reencode:
-        cmd = [
-            exe,
-            "-y",
-            "-ss", f"{start_sec:.3f}",
-            "-i", input_path,
-            "-t", f"{duration:.3f}",
+        base_cmd += [
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "18",
             "-c:a", "aac",
             "-b:a", "192k",
-            output_path,
         ]
     else:
-        cmd = [
-            exe,
-            "-y",
-            "-ss", f"{start_sec:.3f}",
-            "-i", input_path,
-            "-t", f"{duration:.3f}",
-            "-c", "copy",
-            output_path,
-        ]
+        base_cmd += ["-c", "copy"]
 
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
+    cmd = base_cmd + ["-progress", "pipe:1", "-nostats", output_path]
+    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "bufsize": 1}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    res = subprocess.run(cmd, **kwargs)
-    if res.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed:\n{res.stderr[-800:]}")
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    if proc.stdout:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    val = int(line.split("=", 1)[1])
+                    pct = min(100.0, max(0.0, (val / 1_000_000.0) / duration * 100.0))
+                    if progress_cb:
+                        progress_cb(pct)
+                except ValueError:
+                    pass
+            elif line == "progress=end" and progress_cb:
+                progress_cb(100.0)
+
+    _, err = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg failed:\n{(err or '')[-800:]}")

@@ -1,6 +1,20 @@
+import ctypes
 import os
 import sys
 import threading
+
+# Enable crisp High-DPI rendering on Windows 10/11 (prevents blurry bitmap scaling)
+if os.name == "nt":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor DPI Aware
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # System DPI Aware
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
@@ -27,8 +41,19 @@ class VRAutoTrimmerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("SnipVR.IQ")
-        self.geometry("980x680")
-        self.minsize(880, 620)
+        dpi_scale = 1.0
+        if os.name == "nt":
+            try:
+                dpi = self.winfo_fpixels("1i")
+                dpi_scale = max(1.0, dpi / 96.0)
+                self.tk.call("tk", "scaling", dpi / 72.0)
+            except Exception:
+                dpi_scale = 1.0
+        self._dpi_scale = dpi_scale
+        w_init, h_init = int(1040 * dpi_scale), int(720 * dpi_scale)
+        w_min, h_min = int(920 * dpi_scale), int(640 * dpi_scale)
+        self.geometry(f"{w_init}x{h_init}")
+        self.minsize(w_min, h_min)
         self.configure(bg="#111827")
         icon_cand = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "app_icon.ico")
         if os.name == "nt" and os.path.isfile(icon_cand):
@@ -88,8 +113,8 @@ class VRAutoTrimmerApp(tk.Tk):
         style.configure("TNotebook", background="#111827", borderwidth=0)
         style.configure("TNotebook.Tab", background="#1f2937", foreground="#e5e7eb", padding=(18, 8), font=("Segoe UI", 10, "bold"))
         style.map("TNotebook.Tab", background=[("selected", "#2563eb")], foreground=[("selected", "#ffffff")])
-        style.configure("Treeview", background="#1f2937", foreground="#f3f4f6", fieldbackground="#1f2937", rowheight=28, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background="#374151", foreground="#f9fafb", font=("Segoe UI", 9, "bold"))
+        style.configure("Treeview", background="#1f2937", foreground="#f3f4f6", fieldbackground="#1f2937", rowheight=int(30 * self._dpi_scale), font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", background="#374151", foreground="#f9fafb", font=("Segoe UI", 10, "bold"))
         style.configure("Analysis.Horizontal.TProgressbar", troughcolor="#0f172a", background="#3b82f6", thickness=14)
 
     def _build_ui(self) -> None:
@@ -562,10 +587,14 @@ class VRAutoTrimmerApp(tk.Tk):
         if not export_targets:
             return
 
+        self._start_loading_ui(f"Preparing to export {len(export_targets)} video(s)...")
+
         def worker() -> None:
             exported = 0
             last_out = ""
-            for p, out_path in export_targets.items():
+            total_exp = len(export_targets)
+            for idx_e, (p, out_path) in enumerate(export_targets.items(), start=1):
+                out_name = os.path.basename(out_path)
                 try:
                     if p not in self.detections:
                         self.after(0, lambda p=p: self.tree.set(p, "status", "Analyzing..."))
@@ -573,6 +602,13 @@ class VRAutoTrimmerApp(tk.Tk):
                             p,
                             model=self.model if self.model.is_trained() else None,
                             progress_cb=lambda msg: self.after(0, lambda m=msg: self.status_var.set(m)),
+                            frame_progress_cb=lambda cf, tf, fn=os.path.basename(p), ie=idx_e: self.after(
+                                0,
+                                lambda c=cf, t=tf, f=fn, i=ie: self._update_loading_ui(
+                                    f"Analyzing ({i}/{total_exp}) {f} — Frame {c:,} / {t:,} ({(c/t*100 if t else 0):.0f}%)",
+                                    (c / t * 100.0) if t else 0.0,
+                                ),
+                            ),
                         )
                         self.detections[p] = res
                         kept = res.end_time - res.start_time
@@ -595,8 +631,19 @@ class VRAutoTrimmerApp(tk.Tk):
                         self.after(0, lambda p=p: self.tree.set(p, "status", "Exporting..."))
 
                     res = self.detections[p]
-                    self.after(0, lambda fn=os.path.basename(out_path): self.status_var.set(f"Exporting {fn}..."))
-                    trim_video_ffmpeg(p, out_path, res.start_time, res.end_time, reencode=True)
+                    self.after(0, lambda fn=out_name, ie=idx_e: self._update_loading_ui(f"Exporting ({ie}/{total_exp}) {fn} — 0%", 0.0))
+                    self.after(0, lambda fn=out_name: self.status_var.set(f"Exporting {fn}..."))
+                    trim_video_ffmpeg(
+                        p,
+                        out_path,
+                        res.start_time,
+                        res.end_time,
+                        reencode=True,
+                        progress_cb=lambda pct, fn=out_name, ie=idx_e: self.after(
+                            0,
+                            lambda pc=pct, f=fn, i=ie: self._update_loading_ui(f"Exporting ({i}/{total_exp}) {f} — {pc:.0f}%", pc),
+                        ),
+                    )
                     exported += 1
                     last_out = out_path
                     self.after(0, lambda p=p: self.tree.set(p, "status", "Exported"))
@@ -604,11 +651,15 @@ class VRAutoTrimmerApp(tk.Tk):
                     self.after(0, lambda p=p: self.tree.set(p, "status", "Export Error"))
                     self.after(0, lambda e=exc: messagebox.showerror("Export Error", str(e)))
 
-            self.after(0, self._update_total_duration)
-            if exported > 0:
-                msg = f"Saved to:\n{last_out}" if exported == 1 else f"Exported {exported} video(s)."
-                self.after(0, lambda: self.status_var.set(f"Exported {exported} video(s)."))
-                self.after(0, lambda m=msg: messagebox.showinfo("Export Complete", m))
+            def finish_export() -> None:
+                self._stop_loading_ui()
+                self._update_total_duration()
+                if exported > 0:
+                    msg = f"Saved to:\n{last_out}" if exported == 1 else f"Exported {exported} video(s)."
+                    self.status_var.set(f"Exported {exported} video(s).")
+                    messagebox.showinfo("Export Complete", msg)
+
+            self.after(0, finish_export)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -628,6 +679,9 @@ class VRAutoTrimmerApp(tk.Tk):
         if not out_path:
             return
 
+        out_name = os.path.basename(out_path)
+        self._start_loading_ui(f"Exporting {out_name} — 0%")
+
         def worker() -> None:
             try:
                 if p not in self.detections:
@@ -635,11 +689,23 @@ class VRAutoTrimmerApp(tk.Tk):
                     self.detections[p] = detect_trim_points(p, model=self.model if self.model.is_trained() else None)
                 res = self.detections[p]
                 self.after(0, lambda: self.tree.set(p, "status", "Exporting..."))
-                trim_video_ffmpeg(p, out_path, res.start_time, res.end_time, reencode=True)
+                trim_video_ffmpeg(
+                    p,
+                    out_path,
+                    res.start_time,
+                    res.end_time,
+                    reencode=True,
+                    progress_cb=lambda pct: self.after(
+                        0,
+                        lambda pc=pct: self._update_loading_ui(f"Exporting {out_name} — {pc:.0f}%", pc),
+                    ),
+                )
+                self.after(0, self._stop_loading_ui)
                 self.after(0, lambda: self.tree.set(p, "status", "Exported"))
                 self.after(0, lambda: self.status_var.set(f"Exported to {out_path}"))
                 self.after(0, lambda: messagebox.showinfo("Export Complete", f"Saved to:\n{out_path}"))
             except Exception as exc:
+                self.after(0, self._stop_loading_ui)
                 self.after(0, lambda: self.tree.set(p, "status", "Export Error"))
                 self.after(0, lambda e=exc: messagebox.showerror("Export Error", str(e)))
 
@@ -674,7 +740,7 @@ class VRAutoTrimmerApp(tk.Tk):
         win.title("Start Frame Preview" if is_start else "End Frame Preview (Before Black Fade)")
         win.configure(bg="#0f172a")
         disp = img.copy()
-        disp.thumbnail((900, 720))
+        disp.thumbnail((int(900 * self._dpi_scale), int(720 * self._dpi_scale)), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(disp)
         self._enlarged_photo = photo
         lbl = tk.Label(win, image=photo, bg="#0f172a")
@@ -696,7 +762,7 @@ class VRAutoTrimmerApp(tk.Tk):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         full_img = Image.fromarray(rgb)
         thumb = full_img.copy()
-        thumb.thumbnail((240, 155))
+        thumb.thumbnail((int(240 * self._dpi_scale), int(155 * self._dpi_scale)), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(thumb)
         if is_start:
             self._start_full_img = full_img
@@ -787,7 +853,7 @@ class VRAutoTrimmerApp(tk.Tk):
             return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
-        img.thumbnail((600, 440))
+        img.thumbnail((int(600 * self._dpi_scale), int(440 * self._dpi_scale)), Image.Resampling.LANCZOS)
         self._train_photo = ImageTk.PhotoImage(img)
         self.train_canvas_lbl.config(image=self._train_photo, text="")
         self.train_time_lbl.config(text=f"{fmt_time(t_sec)} / {fmt_time(self.train_duration)}")
