@@ -65,6 +65,9 @@ class VRAutoTrimmerApp(tk.Tk):
         self.output_dir: str = os.path.join(os.path.expanduser("~"), "Videos", "SnipVR.IQ")
         self._start_thumb: Optional[ImageTk.PhotoImage] = None
         self._end_thumb: Optional[ImageTk.PhotoImage] = None
+        self._start_full_img: Optional[Image.Image] = None
+        self._end_full_img: Optional[Image.Image] = None
+        self._enlarged_photo: Optional[ImageTk.PhotoImage] = None
 
         self._setup_styles()
         self._build_ui()
@@ -80,15 +83,24 @@ class VRAutoTrimmerApp(tk.Tk):
         style.configure("Treeview.Heading", background="#374151", foreground="#f9fafb", font=("Segoe UI", 9, "bold"))
 
     def _build_ui(self) -> None:
-        header = tk.Frame(self, bg="#1f2937", height=52)
+        header = tk.Frame(self, bg="#1f2937", height=58)
         header.pack(fill="x", side="top")
+        title_box = tk.Frame(header, bg="#1f2937")
+        title_box.pack(side="left", padx=16, pady=6)
         tk.Label(
-            header,
+            title_box,
             text="SnipVR.IQ",
             bg="#1f2937",
             fg="#f9fafb",
             font=("Segoe UI", 14, "bold"),
-        ).pack(side="left", padx=16, pady=10)
+        ).pack(anchor="w")
+        tk.Label(
+            title_box,
+            text='Built for developers who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
+            bg="#1f2937",
+            fg="#9ca3af",
+            font=("Segoe UI", 8, "italic"),
+        ).pack(anchor="w")
 
         self.model_status_lbl = tk.Label(
             header,
@@ -197,13 +209,15 @@ class VRAutoTrimmerApp(tk.Tk):
 
         tk.Label(preview_panel, text="Cut Preview", bg="#1f2937", fg="#f9fafb", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
-        tk.Label(preview_panel, text="Start Frame:", bg="#1f2937", fg="#93c5fd", font=("Segoe UI", 9)).pack(anchor="w")
-        self.start_thumb_lbl = tk.Label(preview_panel, bg="#0f172a", width=240, height=155)
+        tk.Label(preview_panel, text="Start Frame (click to enlarge):", bg="#1f2937", fg="#93c5fd", font=("Segoe UI", 9)).pack(anchor="w")
+        self.start_thumb_lbl = tk.Label(preview_panel, bg="#0f172a", width=240, height=155, cursor="hand2")
         self.start_thumb_lbl.pack(pady=(4, 10))
+        self.start_thumb_lbl.bind("<Button-1>", lambda _e: self._open_enlarged_preview(is_start=True))
 
-        tk.Label(preview_panel, text="End Frame (before black fade):", bg="#1f2937", fg="#fca5a5", font=("Segoe UI", 9)).pack(anchor="w")
-        self.end_thumb_lbl = tk.Label(preview_panel, bg="#0f172a", width=240, height=155)
+        tk.Label(preview_panel, text="End Frame (click to enlarge):", bg="#1f2937", fg="#fca5a5", font=("Segoe UI", 9)).pack(anchor="w")
+        self.end_thumb_lbl = tk.Label(preview_panel, bg="#0f172a", width=240, height=155, cursor="hand2")
         self.end_thumb_lbl.pack(pady=(4, 10))
+        self.end_thumb_lbl.bind("<Button-1>", lambda _e: self._open_enlarged_preview(is_start=False))
 
         adj_frame = tk.Frame(preview_panel, bg="#1f2937")
         adj_frame.pack(fill="x", pady=(4, 0))
@@ -402,7 +416,8 @@ class VRAutoTrimmerApp(tk.Tk):
                 except Exception as exc:
                     self.after(0, lambda p=p, e=exc: self.tree.set(p, "status", f"Error: {e}"))
             self.after(0, self._update_total_duration)
-            self.after(0, lambda: self.status_var.set("Cuts detected. Select a row to preview or click 'Auto-Trim & Export All'."))
+            self.after(0, self._auto_preview_first)
+            self.after(0, lambda: self.status_var.set("Cuts detected. Click any preview image to enlarge, or click 'Auto-Trim & Export All'."))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -547,24 +562,52 @@ class VRAutoTrimmerApp(tk.Tk):
         self._load_thumb(p, res.start_time, is_start=True)
         self._load_thumb(p, max(0.0, res.end_time - 0.1), is_start=False)
 
+    def _auto_preview_first(self) -> None:
+        sel = self.tree.selection()
+        target = sel[0] if sel else (self.queue_paths[0] if self.queue_paths else None)
+        if target and target in self.detections:
+            self.tree.selection_set(target)
+            self.tree.focus(target)
+            self._on_select_queue_item()
+
+    def _open_enlarged_preview(self, is_start: bool) -> None:
+        img = self._start_full_img if is_start else self._end_full_img
+        if img is None:
+            return
+        win = tk.Toplevel(self)
+        win.title("Start Frame Preview" if is_start else "End Frame Preview (Before Black Fade)")
+        win.configure(bg="#0f172a")
+        disp = img.copy()
+        disp.thumbnail((900, 720))
+        photo = ImageTk.PhotoImage(disp)
+        self._enlarged_photo = photo
+        lbl = tk.Label(win, image=photo, bg="#0f172a")
+        lbl.pack(padx=12, pady=12)
+        lbl.bind("<Button-1>", lambda _e: win.destroy())
+
     def _load_thumb(self, video_path: str, t_sec: float, is_start: bool) -> None:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(t_sec * fps))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        idx = max(0, min(int(t_sec * fps), max(0, total - 1)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         cap.release()
         if not ret:
             return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        img.thumbnail((240, 155))
-        photo = ImageTk.PhotoImage(img)
+        full_img = Image.fromarray(rgb)
+        thumb = full_img.copy()
+        thumb.thumbnail((240, 155))
+        photo = ImageTk.PhotoImage(thumb)
         if is_start:
+            self._start_full_img = full_img
             self._start_thumb = photo
             self.start_thumb_lbl.config(image=photo)
         else:
+            self._end_full_img = full_img
             self._end_thumb = photo
             self.end_thumb_lbl.config(image=photo)
 

@@ -1,5 +1,7 @@
 # SnipVR.IQ
 
+> Built for developers who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.
+
 Trainable Windows desktop app that automatically removes **app initialization / VR shell intro frames** and **ending black fade + outro clips**, keeping only the center clip.
 
 ## Features
