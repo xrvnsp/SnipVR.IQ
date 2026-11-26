@@ -30,6 +30,12 @@ class VRAutoTrimmerApp(tk.Tk):
         self.geometry("980x680")
         self.minsize(880, 620)
         self.configure(bg="#111827")
+        icon_cand = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "app_icon.ico")
+        if os.name == "nt" and os.path.isfile(icon_cand):
+            try:
+                self.iconbitmap(icon_cand)
+            except Exception:
+                pass
 
         self.app_dir = (
             os.path.dirname(sys.executable)

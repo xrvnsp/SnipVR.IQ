@@ -63,6 +63,8 @@ $VenvPy = Join-Path $VenvDir "Scripts\python.exe"
 
 Write-Host "=== 3. Building standalone SnipVR.IQ.exe ===" -ForegroundColor Cyan
 & $VenvPy -m PyInstaller --noconfirm --onefile --windowed --name "SnipVR.IQ" `
+    --icon "app_icon.ico" `
+    --add-data "app_icon.ico;." `
     --add-data "default_model.npz;." `
     --collect-binaries imageio_ffmpeg `
     (Join-Path $Root "app.py")
