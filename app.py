@@ -27,8 +27,14 @@ from trimmer_engine import (
     TrainableTrimModel,
     detect_trim_points,
     get_video_info,
+    pull_from_quest_adb,
     trim_video_ffmpeg,
 )
+
+try:
+    import windnd
+except Exception:
+    windnd = None
 
 
 def fmt_time(sec: float) -> str:
@@ -102,10 +108,18 @@ class VRAutoTrimmerApp(tk.Tk):
         self._is_analyzing: bool = False
         self._spinner_idx: int = 0
         self._spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        self.watch_folder: Optional[str] = None
+        self._watch_seen_sizes: Dict[str, int] = {}
+        self._watch_queued: set = set()
 
         self._setup_styles()
         self._build_ui()
         self._refresh_model_status()
+        if windnd is not None:
+            try:
+                windnd.hook_dropfiles(self, func=self._on_drop_files)
+            except Exception:
+                pass
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self)
@@ -131,20 +145,29 @@ class VRAutoTrimmerApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_box,
-            text='Built for developers who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
+            text='Built for developers ❤️ who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
             bg="#1f2937",
             fg="#cbd5e1",
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(2, 0))
 
+        right_hdr = tk.Frame(header, bg="#1f2937")
+        right_hdr.pack(side="right", padx=16, pady=8)
         self.model_status_lbl = tk.Label(
-            header,
+            right_hdr,
             text="",
             bg="#1f2937",
             fg="#93c5fd",
             font=("Segoe UI", 9, "bold"),
         )
-        self.model_status_lbl.pack(side="right", padx=16)
+        self.model_status_lbl.pack(anchor="e")
+        tk.Label(
+            right_hdr,
+            text="Made by SP",
+            bg="#1f2937",
+            fg="#94a3b8",
+            font=("Segoe UI Semibold", 9),
+        ).pack(anchor="e", pady=(2, 0))
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=10)
@@ -157,7 +180,7 @@ class VRAutoTrimmerApp(tk.Tk):
         self._build_trim_tab()
         self._build_train_tab()
 
-        self.status_var = tk.StringVar(value="Add video(s) and click 'Auto-Trim & Export'.")
+        self.status_var = tk.StringVar(value="Drag & drop videos/folders anywhere, pull from Quest USB, or click + Add Video(s).")
         tk.Label(
             self,
             textvariable=self.status_var,
@@ -182,7 +205,10 @@ class VRAutoTrimmerApp(tk.Tk):
 
         tk.Button(top_bar, text="+ Add Video(s)", command=self._add_videos, **btn_blue).pack(side="left", padx=(0, 6))
         tk.Button(top_bar, text="+ Add Folder", command=self._add_folder, **btn_gray).pack(side="left", padx=(0, 6))
-        tk.Button(top_bar, text="Clear", command=self._clear_queue, **btn_gray).pack(side="left", padx=(0, 14))
+        tk.Button(top_bar, text="Clear", command=self._clear_queue, **btn_gray).pack(side="left", padx=(0, 8))
+        tk.Button(top_bar, text="Pull from Quest (USB)", command=self._pull_from_quest_async, bg="#7c3aed", fg="#ffffff", relief="flat", padx=12, pady=7, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left", padx=(0, 6))
+        self.watch_btn = tk.Button(top_bar, text="Watch Folder: OFF", command=self._toggle_watch_folder, **btn_gray)
+        self.watch_btn.pack(side="left", padx=(0, 10))
 
         tk.Button(top_bar, text="Auto-Trim & Export All", command=self._trim_all_async, **btn_green).pack(side="right")
 
@@ -233,7 +259,7 @@ class VRAutoTrimmerApp(tk.Tk):
         left_col = tk.Frame(body, bg="#111827")
         left_col.pack(side="left", fill="both", expand=True)
 
-        cols = ("file", "duration", "start", "end", "kept", "trimmed", "metrics", "status")
+        cols = ("file", "duration", "start", "end", "kept", "trimmed", "metrics", "audio", "status")
         self.tree = ttk.Treeview(left_col, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("file", text="Video File")
         self.tree.heading("duration", text="Original")
@@ -242,16 +268,18 @@ class VRAutoTrimmerApp(tk.Tk):
         self.tree.heading("kept", text="Kept")
         self.tree.heading("trimmed", text="Time Trimmed")
         self.tree.heading("metrics", text="Metrics")
+        self.tree.heading("audio", text="Audio")
         self.tree.heading("status", text="Status")
 
-        self.tree.column("file", width=220)
-        self.tree.column("duration", width=70, anchor="center")
-        self.tree.column("start", width=70, anchor="center")
-        self.tree.column("end", width=70, anchor="center")
-        self.tree.column("kept", width=70, anchor="center")
-        self.tree.column("trimmed", width=85, anchor="center")
-        self.tree.column("metrics", width=105, anchor="center")
-        self.tree.column("status", width=110, anchor="center")
+        self.tree.column("file", width=195)
+        self.tree.column("duration", width=65, anchor="center")
+        self.tree.column("start", width=65, anchor="center")
+        self.tree.column("end", width=65, anchor="center")
+        self.tree.column("kept", width=65, anchor="center")
+        self.tree.column("trimmed", width=80, anchor="center")
+        self.tree.column("metrics", width=98, anchor="center")
+        self.tree.column("audio", width=85, anchor="center")
+        self.tree.column("status", width=100, anchor="center")
         self.tree.tag_configure("metrics_warn", foreground="#f87171", background="#3b1518")
         self.tree.pack(side="top", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_select_queue_item)
@@ -403,6 +431,115 @@ class VRAutoTrimmerApp(tk.Tk):
         for rec in self.model.training_records:
             self.train_history_box.insert("end", f"{rec['video']} ({rec['keep_start_sec']:.1f}s - {rec['keep_end_sec']:.1f}s)")
 
+    def _enqueue_video_paths(self, paths: List[str]) -> None:
+        added: List[str] = []
+        for raw_p in paths:
+            if os.path.isdir(raw_p):
+                for name in sorted(os.listdir(raw_p)):
+                    if name.lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+                        full_p = os.path.join(raw_p, name)
+                        if full_p not in self.queue_paths:
+                            self.queue_paths.append(full_p)
+                            added.append(full_p)
+                            try:
+                                _, dur, _ = get_video_info(full_p)
+                            except Exception:
+                                dur = 0.0
+                            self.tree.insert("", "end", iid=full_p, values=(name, fmt_time(dur), "-", "-", "-", "-", "-", "-", "Queued"))
+            elif os.path.isfile(raw_p) and raw_p.lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+                if raw_p not in self.queue_paths:
+                    self.queue_paths.append(raw_p)
+                    added.append(raw_p)
+                    try:
+                        _, dur, _ = get_video_info(raw_p)
+                    except Exception:
+                        dur = 0.0
+                    self.tree.insert("", "end", iid=raw_p, values=(os.path.basename(raw_p), fmt_time(dur), "-", "-", "-", "-", "-", "-", "Queued"))
+        if added:
+            self._analyze_paths_async(added)
+
+    def _on_drop_files(self, files) -> None:
+        decoded: List[str] = []
+        for item in files:
+            if isinstance(item, bytes):
+                try:
+                    decoded.append(item.decode("utf-8"))
+                except UnicodeDecodeError:
+                    decoded.append(item.decode("mbcs", errors="ignore"))
+            else:
+                decoded.append(str(item))
+        if decoded:
+            self.after(0, lambda d=decoded: self._enqueue_video_paths(d))
+
+    def _toggle_watch_folder(self) -> None:
+        if self.watch_folder:
+            self.watch_folder = None
+            self.watch_btn.config(text="Watch Folder: OFF", bg="#374151", fg="#f9fafb")
+            self.status_var.set("Auto-Watch Folder stopped.")
+            return
+        folder = filedialog.askdirectory(title="Select Folder to Auto-Watch for New Recordings")
+        if not folder:
+            return
+        self.watch_folder = folder
+        self._watch_seen_sizes.clear()
+        self._watch_queued = set(self.queue_paths)
+        # Mark existing files as already seen so only newly copied files trigger auto-queue
+        for name in os.listdir(folder):
+            if name.lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+                self._watch_queued.add(os.path.join(folder, name))
+        self.watch_btn.config(text="Watch Folder: ON", bg="#0284c7", fg="#ffffff")
+        self.status_var.set(f"Watching folder for new videos: {folder}")
+        self.after(2500, self._poll_watch_folder)
+
+    def _poll_watch_folder(self) -> None:
+        if not self.watch_folder or not os.path.isdir(self.watch_folder):
+            return
+        newly_ready: List[str] = []
+        try:
+            for name in sorted(os.listdir(self.watch_folder)):
+                if not name.lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
+                    continue
+                fp = os.path.join(self.watch_folder, name)
+                if fp in self._watch_queued or not os.path.isfile(fp):
+                    continue
+                size = os.path.getsize(fp)
+                if size > 0 and self._watch_seen_sizes.get(fp) == size:
+                    self._watch_queued.add(fp)
+                    newly_ready.append(fp)
+                else:
+                    self._watch_seen_sizes[fp] = size
+        except Exception:
+            pass
+        if newly_ready:
+            self._enqueue_video_paths(newly_ready)
+        if self.watch_folder:
+            self.after(2500, self._poll_watch_folder)
+
+    def _pull_from_quest_async(self) -> None:
+        dest_dir = os.path.join(self.output_dir, "Quest_Pulls")
+        self._start_loading_ui("Connecting to Meta Quest over USB (ADB)...")
+
+        def worker() -> None:
+            try:
+                pulled = pull_from_quest_adb(
+                    dest_dir,
+                    progress_cb=lambda msg: self.after(0, lambda m=msg: self._update_loading_ui(m, 50.0)),
+                )
+                def on_done() -> None:
+                    self._stop_loading_ui()
+                    if pulled:
+                        self.status_var.set(f"Pulled {len(pulled)} new video(s) from Quest.")
+                        self._enqueue_video_paths(pulled)
+                    else:
+                        self.status_var.set("Quest connected — no new recordings to pull.")
+                        messagebox.showinfo("Quest Pull", f"No new .mp4 recordings found on Quest.\n(Already downloaded clips are in {dest_dir})")
+                self.after(0, on_done)
+            except Exception as exc:
+                self.after(0, self._stop_loading_ui)
+                self.after(0, lambda e=exc: messagebox.showwarning("Quest USB Pull", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _add_videos(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Select VR Video(s)",
@@ -417,7 +554,7 @@ class VRAutoTrimmerApp(tk.Tk):
                     _, dur, _ = get_video_info(p)
                 except Exception:
                     dur = 0.0
-                self.tree.insert("", "end", iid=p, values=(os.path.basename(p), fmt_time(dur), "-", "-", "-", "-", "-", "Queued"))
+                self.tree.insert("", "end", iid=p, values=(os.path.basename(p), fmt_time(dur), "-", "-", "-", "-", "-", "-", "Queued"))
         if added:
             self._analyze_paths_async(added)
 
@@ -436,7 +573,7 @@ class VRAutoTrimmerApp(tk.Tk):
                         _, dur, _ = get_video_info(p)
                     except Exception:
                         dur = 0.0
-                    self.tree.insert("", "end", iid=p, values=(name, fmt_time(dur), "-", "-", "-", "-", "-", "Queued"))
+                    self.tree.insert("", "end", iid=p, values=(name, fmt_time(dur), "-", "-", "-", "-", "-", "-", "Queued"))
         if added:
             self._analyze_paths_async(added)
 
@@ -529,9 +666,10 @@ class VRAutoTrimmerApp(tk.Tk):
                                 fmt_time(k),
                                 fmt_time(tr),
                                 "⚠ METRICS ON" if r.has_metrics_overlay else "Clean",
+                                r.audio_status,
                                 "Ready to Export",
                             ),
-                            tags=("metrics_warn",) if r.has_metrics_overlay else (),
+                            tags=("metrics_warn",) if (r.has_metrics_overlay or r.has_audio_issue) else (),
                         ),
                     )
                 except Exception as exc:
@@ -546,20 +684,20 @@ class VRAutoTrimmerApp(tk.Tk):
                     total_kept = sum(max(0.0, r.end_time - r.start_time) for r in self.detections.values())
                     total_orig = sum(r.duration for r in self.detections.values())
                     total_trim = max(0.0, total_orig - total_kept)
-                    warn_vids = [os.path.basename(k) for k, r in self.detections.items() if r.has_metrics_overlay]
-                    warn_note = (
-                        f"\n\n⚠ WARNING: OVR Metrics overlay detected in {len(warn_vids)} video(s):\n• "
-                        + "\n• ".join(warn_vids)
-                        if warn_vids
-                        else ""
-                    )
-                    if warn_vids:
+                    metrics_warns = [os.path.basename(k) for k, r in self.detections.items() if r.has_metrics_overlay]
+                    audio_warns = [f"{os.path.basename(k)} ({r.audio_status})" for k, r in self.detections.items() if r.has_audio_issue]
+                    warn_parts = []
+                    if metrics_warns:
+                        warn_parts.append(f"⚠ OVR Metrics overlay in {len(metrics_warns)} video(s):\n• " + "\n• ".join(metrics_warns))
+                    if audio_warns:
+                        warn_parts.append(f"⚠ Muted / No Audio in {len(audio_warns)} video(s):\n• " + "\n• ".join(audio_warns))
+                    if warn_parts:
                         messagebox.showwarning(
-                            "Analysis Finished — Metrics Warning",
+                            "Analysis Finished — QA Warnings",
                             f"Finished analyzing {analyzed_count} video(s).\n\n"
                             f"Trimmed Total Duration: {fmt_time(total_kept)}\n"
-                            f"Total Time Removed: {fmt_time(total_trim)}"
-                            f"{warn_note}",
+                            f"Total Time Removed: {fmt_time(total_trim)}\n\n"
+                            + "\n\n".join(warn_parts),
                         )
                     else:
                         messagebox.showinfo(
@@ -656,9 +794,10 @@ class VRAutoTrimmerApp(tk.Tk):
                                     fmt_time(k),
                                     fmt_time(tr),
                                     "⚠ METRICS ON" if r.has_metrics_overlay else "Clean",
+                                    r.audio_status,
                                     "Exporting...",
                                 ),
-                                tags=("metrics_warn",) if r.has_metrics_overlay else (),
+                                tags=("metrics_warn",) if (r.has_metrics_overlay or r.has_audio_issue) else (),
                             ),
                         )
                     else:
@@ -753,7 +892,13 @@ class VRAutoTrimmerApp(tk.Tk):
         if p not in self.detections:
             return
         res = self.detections[p]
+        warns = []
         if res.has_metrics_overlay:
+            warns.append("⚠ OVR Metrics overlay detected throughout video!")
+        if res.has_audio_issue:
+            warns.append(f"⚠ Audio issue: {res.audio_status} (check headset mic/audio)")
+        if warns:
+            self.metrics_warn_lbl.config(text="\n".join(warns))
             if not self.metrics_warn_lbl.winfo_ismapped():
                 self.metrics_warn_lbl.pack(fill="x", pady=(0, 8), before=self.start_thumb_lbl.master.winfo_children()[2])
         else:
@@ -839,9 +984,10 @@ class VRAutoTrimmerApp(tk.Tk):
                     fmt_time(res.end_time - res.start_time),
                     fmt_time(max(0.0, res.duration - (res.end_time - res.start_time))),
                     "⚠ METRICS ON" if res.has_metrics_overlay else "Clean",
+                    res.audio_status,
                     "Adjusted",
                 ),
-                tags=("metrics_warn",) if res.has_metrics_overlay else (),
+                tags=("metrics_warn",) if (res.has_metrics_overlay or res.has_audio_issue) else (),
             )
             self._load_thumb(p, res.start_time, is_start=True)
             self._load_thumb(p, max(0.0, res.end_time - 0.1), is_start=False)

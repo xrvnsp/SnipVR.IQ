@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,9 @@ class DetectionResult:
     confidence_end: float
     has_metrics_overlay: bool = False
     metrics_coverage: float = 0.0
+    has_audio_issue: bool = False
+    audio_status: str = "OK"
+    mean_volume_db: Optional[float] = None
 
 
 def find_ffmpeg(custom_path: Optional[str] = None) -> str:
@@ -391,6 +395,8 @@ def detect_trim_points(
     metrics_cov = float(sum(kept_metrics) / len(kept_metrics)) if kept_metrics else 0.0
     has_metrics = metrics_cov >= 0.40
 
+    has_audio_issue, audio_status, mean_vol = check_audio_status(video_path, start_time, end_time)
+
     return DetectionResult(
         video_path=video_path,
         duration=duration,
@@ -402,6 +408,9 @@ def detect_trim_points(
         confidence_end=round(conf_end, 2),
         has_metrics_overlay=has_metrics,
         metrics_coverage=round(metrics_cov, 2),
+        has_audio_issue=has_audio_issue,
+        audio_status=audio_status,
+        mean_volume_db=mean_vol,
     )
 
 
@@ -485,3 +494,135 @@ def trim_video_ffmpeg(
     ret = proc.wait()
     if ret != 0:
         raise RuntimeError("FFmpeg failed:\n" + "\n".join(tail_logs[-15:]))
+
+
+def check_audio_status(
+    video_path: str,
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+    ffmpeg_bin: Optional[str] = None,
+) -> Tuple[bool, str, Optional[float]]:
+    """
+    Check if audio is missing or silent/muted during the kept clip via FFmpeg volumedetect.
+    Returns (has_audio_issue, status_label, mean_volume_db).
+    """
+    exe = find_ffmpeg(ffmpeg_bin)
+    sample_dur = 30.0
+    if end_sec is not None and end_sec > start_sec:
+        sample_dur = min(30.0, max(1.0, end_sec - start_sec))
+
+    cmd = [
+        exe,
+        "-ss", f"{max(0.0, start_sec):.3f}",
+        "-t", f"{sample_dur:.3f}",
+        "-i", video_path,
+        "-af", "volumedetect",
+        "-vn",
+        "-f", "null",
+        "-",
+    ]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    try:
+        res = subprocess.run(cmd, **kwargs, timeout=25)
+        out = res.stdout or ""
+    except Exception:
+        return False, "OK", None
+
+    m_mean = re.search(r"mean_volume:\s*([-\d\.]+)\s*dB", out)
+    m_max = re.search(r"max_volume:\s*([-\d\.]+)\s*dB", out)
+
+    if "does not contain any stream" in out or (not m_mean and not m_max):
+        return True, "⚠ NO AUDIO", None
+
+    mean_db = float(m_mean.group(1)) if m_mean else -91.0
+    max_db = float(m_max.group(1)) if m_max else -91.0
+
+    if max_db <= -50.0 or mean_db <= -55.0:
+        return True, "⚠ MUTED", round(mean_db, 1)
+    return False, "OK", round(mean_db, 1)
+
+
+def find_adb() -> Optional[str]:
+    """Locate adb executable on Windows/Linux."""
+    which_adb = shutil.which("adb")
+    if which_adb:
+        return which_adb
+    search_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "adb.exe"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe"),
+        r"C:\Program Files\Meta Quest Developer Hub\resources\bin\adb.exe",
+        r"C:\platform-tools\adb.exe",
+    ]
+    if getattr(sys, "frozen", False):
+        search_paths.insert(0, os.path.join(os.path.dirname(sys.executable), "adb.exe"))
+    for p in search_paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def pull_from_quest_adb(
+    dest_dir: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    """Pull new .mp4 recordings from a USB-connected Meta Quest (/sdcard/Oculus/VideoShots/)."""
+    adb = find_adb()
+    if not adb:
+        raise RuntimeError(
+            "ADB (Android Debug Bridge) was not found.\n\n"
+            "Install Android Platform Tools (or Meta Quest Developer Hub) and ensure adb.exe is in PATH or next to SnipVR.IQ.exe."
+        )
+
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    dev_res = subprocess.run([adb, "devices"], **kwargs, timeout=15)
+    lines = [l.strip() for l in (dev_res.stdout or "").splitlines()[1:] if l.strip()]
+    connected = [l for l in lines if l.endswith("\tdevice") or " device" in l]
+    if not connected:
+        raise RuntimeError(
+            "No authorized Meta Quest detected over USB.\n\n"
+            "1. Connect your Quest via USB cable.\n"
+            "2. Enable Developer Mode / USB Debugging and tap 'Allow' inside the headset."
+        )
+
+    remote_dir = "/sdcard/Oculus/VideoShots"
+    ls_res = subprocess.run([adb, "shell", f"ls -1 {remote_dir}"], **kwargs, timeout=15)
+    remote_files = [
+        f.strip()
+        for f in (ls_res.stdout or "").splitlines()
+        if f.strip().lower().endswith(".mp4")
+    ]
+    if not remote_files:
+        return []
+
+    os.makedirs(dest_dir, exist_ok=True)
+    pulled: List[str] = []
+    for idx, fname in enumerate(remote_files, start=1):
+        local_path = os.path.join(dest_dir, fname)
+        if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+            continue
+        if progress_cb:
+            progress_cb(f"Pulling from Quest ({idx}/{len(remote_files)}): {fname}...")
+        pull_res = subprocess.run([adb, "pull", f"{remote_dir}/{fname}", local_path], **kwargs, timeout=180)
+        if pull_res.returncode == 0 and os.path.isfile(local_path):
+            pulled.append(local_path)
+    return pulled
