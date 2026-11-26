@@ -74,6 +74,9 @@ class VRAutoTrimmerApp(tk.Tk):
         self._start_full_img: Optional[Image.Image] = None
         self._end_full_img: Optional[Image.Image] = None
         self._enlarged_photo: Optional[ImageTk.PhotoImage] = None
+        self._is_analyzing: bool = False
+        self._spinner_idx: int = 0
+        self._spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
         self._setup_styles()
         self._build_ui()
@@ -87,26 +90,27 @@ class VRAutoTrimmerApp(tk.Tk):
         style.map("TNotebook.Tab", background=[("selected", "#2563eb")], foreground=[("selected", "#ffffff")])
         style.configure("Treeview", background="#1f2937", foreground="#f3f4f6", fieldbackground="#1f2937", rowheight=28, font=("Segoe UI", 9))
         style.configure("Treeview.Heading", background="#374151", foreground="#f9fafb", font=("Segoe UI", 9, "bold"))
+        style.configure("Analysis.Horizontal.TProgressbar", troughcolor="#0f172a", background="#3b82f6", thickness=14)
 
     def _build_ui(self) -> None:
-        header = tk.Frame(self, bg="#1f2937", height=58)
+        header = tk.Frame(self, bg="#1f2937", height=70)
         header.pack(fill="x", side="top")
         title_box = tk.Frame(header, bg="#1f2937")
-        title_box.pack(side="left", padx=16, pady=6)
+        title_box.pack(side="left", padx=16, pady=10)
         tk.Label(
             title_box,
             text="SnipVR.IQ",
             bg="#1f2937",
-            fg="#f9fafb",
-            font=("Segoe UI", 14, "bold"),
+            fg="#ffffff",
+            font=("Segoe UI Semibold", 16, "bold"),
         ).pack(anchor="w")
         tk.Label(
             title_box,
             text='Built for developers who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
             bg="#1f2937",
-            fg="#9ca3af",
-            font=("Segoe UI", 8, "italic"),
-        ).pack(anchor="w")
+            fg="#cbd5e1",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(2, 0))
 
         self.model_status_lbl = tk.Label(
             header,
@@ -168,6 +172,34 @@ class VRAutoTrimmerApp(tk.Tk):
         tk.Button(exp_bar, text="Change Folder...", command=self._choose_output_dir, bg="#374151", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=(0, 6))
         tk.Button(exp_bar, text="Open Export Folder", command=self._open_output_dir, bg="#374151", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9), cursor="hand2").pack(side="left")
         tk.Button(exp_bar, text="Export Selected As...", command=self._export_selected_as, bg="#1d4ed8", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right")
+
+        # Live Analysis Loading Bar (shown while analyzing)
+        self.loading_bar_frame = tk.Frame(self.trim_tab, bg="#1e293b", padx=12, pady=8, highlightbackground="#3b82f6", highlightthickness=1)
+        self.loading_spinner_lbl = tk.Label(
+            self.loading_bar_frame,
+            text="⠋",
+            bg="#1e293b",
+            fg="#60a5fa",
+            font=("Segoe UI", 13, "bold"),
+        )
+        self.loading_spinner_lbl.pack(side="left", padx=(0, 8))
+        self.loading_text_lbl = tk.Label(
+            self.loading_bar_frame,
+            text="Analyzing video frames...",
+            bg="#1e293b",
+            fg="#f8fafc",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.loading_text_lbl.pack(side="left")
+        self.loading_progress = ttk.Progressbar(
+            self.loading_bar_frame,
+            style="Analysis.Horizontal.TProgressbar",
+            orient="horizontal",
+            length=260,
+            mode="determinate",
+            maximum=100,
+        )
+        self.loading_progress.pack(side="right", padx=(12, 0))
 
         # Main area: Queue table + Simple Cut Preview
         body = tk.Frame(self.trim_tab, bg="#111827")
@@ -395,20 +427,56 @@ class VRAutoTrimmerApp(tk.Tk):
         if os.name == "nt":
             os.startfile(self.output_dir)
 
+    def _start_loading_ui(self, initial_text: str) -> None:
+        self._is_analyzing = True
+        self.loading_progress["value"] = 0
+        self.loading_text_lbl.config(text=initial_text)
+        if not self.loading_bar_frame.winfo_ismapped():
+            self.loading_bar_frame.pack(fill="x", pady=(0, 10), before=self.tree.master.master)
+        self._tick_spinner()
+
+    def _tick_spinner(self) -> None:
+        if not self._is_analyzing:
+            return
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        self.loading_spinner_lbl.config(text=self._spinner_frames[self._spinner_idx])
+        self.after(90, self._tick_spinner)
+
+    def _update_loading_ui(self, text: str, pct: float) -> None:
+        if self._is_analyzing:
+            self.loading_text_lbl.config(text=text)
+            self.loading_progress["value"] = max(0.0, min(100.0, pct))
+
+    def _stop_loading_ui(self) -> None:
+        self._is_analyzing = False
+        if self.loading_bar_frame.winfo_ismapped():
+            self.loading_bar_frame.pack_forget()
+
     def _analyze_paths_async(self, paths: List[str]) -> None:
         if not paths:
             return
+        self._start_loading_ui(f"Preparing to analyze {len(paths)} video(s)...")
 
         def worker() -> None:
-            for p in list(paths):
+            analyzed_count = 0
+            total_videos = len(paths)
+            for idx_v, p in enumerate(list(paths), start=1):
+                fname = os.path.basename(p)
                 self.after(0, lambda p=p: self.tree.set(p, "status", "Analyzing..."))
                 try:
+                    def on_frame(cur_f: int, tot_f: int, fn: str = fname, iv: int = idx_v) -> None:
+                        pct = (cur_f / tot_f * 100.0) if tot_f > 0 else 0.0
+                        msg = f"Analyzing ({iv}/{total_videos}) {fn} — Frame {cur_f:,} / {tot_f:,} ({pct:.0f}%)"
+                        self.after(0, lambda m=msg, pc=pct: self._update_loading_ui(m, pc))
+
                     res = detect_trim_points(
                         p,
                         model=self.model if self.model.is_trained() else None,
                         progress_cb=lambda msg: self.after(0, lambda m=msg: self.status_var.set(m)),
+                        frame_progress_cb=on_frame,
                     )
                     self.detections[p] = res
+                    analyzed_count += 1
                     kept = res.end_time - res.start_time
                     self.after(
                         0,
@@ -427,9 +495,25 @@ class VRAutoTrimmerApp(tk.Tk):
                     )
                 except Exception as exc:
                     self.after(0, lambda p=p, e=exc: self.tree.set(p, "status", f"Error: {e}"))
-            self.after(0, self._update_total_duration)
-            self.after(0, self._auto_preview_first)
-            self.after(0, lambda: self.status_var.set("Cuts detected. Click any preview image to enlarge, or click 'Auto-Trim & Export All'."))
+
+            def finish() -> None:
+                self._stop_loading_ui()
+                self._update_total_duration()
+                self._auto_preview_first()
+                self.status_var.set("Analysis finished. Click any preview image to enlarge, or click 'Auto-Trim & Export All'.")
+                if analyzed_count > 0:
+                    total_kept = sum(max(0.0, r.end_time - r.start_time) for r in self.detections.values())
+                    total_orig = sum(r.duration for r in self.detections.values())
+                    total_trim = max(0.0, total_orig - total_kept)
+                    messagebox.showinfo(
+                        "Analysis Finished",
+                        f"Finished analyzing {analyzed_count} video(s).\n\n"
+                        f"Trimmed Total Duration: {fmt_time(total_kept)}\n"
+                        f"Total Time Removed: {fmt_time(total_trim)}\n\n"
+                        "Check the Cut Preview on the right, then click 'Auto-Trim & Export All'.",
+                    )
+
+            self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 

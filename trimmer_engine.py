@@ -233,6 +233,7 @@ def detect_trim_points(
     black_min_duration: float = 0.05,
     sample_interval_sec: float = 0.2,
     progress_cb: Optional[Callable[[str], None]] = None,
+    frame_progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> DetectionResult:
     """
     Single-pass sequential scan to:
@@ -289,9 +290,13 @@ def detect_trim_points(
                 if need_cls:
                     times.append(t)
                     scores.append(model.score_frame(frame))
-                    if progress_cb and len(times) % 25 == 0:
+                    if progress_cb and len(times) % 15 == 0:
                         progress_cb(f"Analyzing {os.path.basename(video_path)}: {t:.1f}s / {duration:.1f}s")
+        if frame_progress_cb and (frame_idx % 15 == 0):
+            frame_progress_cb(frame_idx, total_frames)
         frame_idx += 1
+    if frame_progress_cb:
+        frame_progress_cb(total_frames, total_frames)
 
     if in_black:
         t_end = frame_idx / fps
