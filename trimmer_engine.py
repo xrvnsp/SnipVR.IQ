@@ -711,3 +711,56 @@ def pull_from_quest_adb(
         if pull_res.returncode == 0 and os.path.isfile(local_path):
             pulled.append(local_path)
     return pulled
+
+
+def list_quest_videos_adb(progress_cb: Optional[Callable[[str], None]] = None) -> List[Tuple[str, str]]:
+    """List .mp4 files in /sdcard/Oculus/VideoShots (newest first) WITHOUT copying them locally."""
+    adb = ensure_adb(progress_cb=progress_cb)
+    kwargs = _adb_run_kwargs()
+
+    dev_res = subprocess.run([adb, "devices"], **kwargs, timeout=15)
+    lines = [l.strip() for l in (dev_res.stdout or "").splitlines()[1:] if l.strip()]
+    connected = [l for l in lines if l.endswith("\tdevice") or " device" in l]
+    if not connected:
+        raise RuntimeError(
+            "No authorized Meta Quest detected over USB.\n\n"
+            "1. Connect your Quest via USB cable.\n"
+            "2. Enable Developer Mode / USB Debugging and tap 'Allow' inside the headset."
+        )
+
+    remote_dir = "/sdcard/Oculus/VideoShots"
+    ls_res = subprocess.run([adb, "shell", f"ls -lh -t {remote_dir}"], **kwargs, timeout=15)
+    items: List[Tuple[str, str]] = []
+    for line in (ls_res.stdout or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        fname = parts[-1].strip()
+        if not fname.lower().endswith(".mp4"):
+            continue
+        size_str = parts[4] if len(parts) >= 5 else ""
+        items.append((fname, size_str))
+    return items
+
+
+def pull_quest_files_adb(
+    filenames: List[str],
+    dest_dir: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    """Pull ONLY the specified filenames from /sdcard/Oculus/VideoShots into dest_dir (temp folder)."""
+    if not filenames:
+        return []
+    adb = ensure_adb(progress_cb=progress_cb)
+    kwargs = _adb_run_kwargs()
+    remote_dir = "/sdcard/Oculus/VideoShots"
+    os.makedirs(dest_dir, exist_ok=True)
+    pulled: List[str] = []
+    for idx, fname in enumerate(filenames, start=1):
+        local_path = os.path.join(dest_dir, fname)
+        if progress_cb:
+            progress_cb(f"Loading from Quest ({idx}/{len(filenames)}): {fname}...")
+        pull_res = subprocess.run([adb, "pull", f"{remote_dir}/{fname}", local_path], **kwargs, timeout=180)
+        if pull_res.returncode == 0 and os.path.isfile(local_path):
+            pulled.append(local_path)
+    return pulled

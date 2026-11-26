@@ -1,5 +1,8 @@
 import ctypes
+import atexit
 import os
+import shutil
+import tempfile
 import sys
 import threading
 
@@ -28,7 +31,9 @@ from trimmer_engine import (
     detect_trim_points,
     get_quest_status,
     get_video_info,
+    list_quest_videos_adb,
     pull_from_quest_adb,
+    pull_quest_files_adb,
     trim_video_ffmpeg,
 )
 
@@ -120,6 +125,9 @@ class VRAutoTrimmerApp(_BASE_TK):
         self.watch_folder: Optional[str] = None
         self._watch_seen_sizes: Dict[str, int] = {}
         self._watch_queued: set = set()
+        self._quest_temp_dir: str = tempfile.mkdtemp(prefix="snipvr_quest_")
+        atexit.register(shutil.rmtree, self._quest_temp_dir, True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._setup_styles()
         self._build_ui()
@@ -179,7 +187,7 @@ class VRAutoTrimmerApp(_BASE_TK):
         ).pack(side="left")
 
         right_hdr = tk.Frame(header, bg="#1f2937")
-        right_hdr.pack(side="right", padx=16, pady=8)
+        right_hdr.pack(side="right", padx=(8, 22), pady=8)
         self.model_status_lbl = tk.Label(
             right_hdr,
             text="",
@@ -233,7 +241,7 @@ class VRAutoTrimmerApp(_BASE_TK):
         tk.Button(top_bar, text="+ Add Video(s)", command=self._add_videos, **btn_blue).pack(side="left", padx=(0, 6))
         tk.Button(top_bar, text="+ Add Folder", command=self._add_folder, **btn_gray).pack(side="left", padx=(0, 6))
         tk.Button(top_bar, text="Clear", command=self._clear_queue, **btn_gray).pack(side="left", padx=(0, 8))
-        tk.Button(top_bar, text="Pull from Quest (USB)", command=self._pull_from_quest_async, bg="#7c3aed", fg="#ffffff", relief="flat", padx=12, pady=7, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left", padx=(0, 6))
+        tk.Button(top_bar, text="Browse Quest (USB)", command=self._browse_quest_videos_async, bg="#7c3aed", fg="#ffffff", relief="flat", padx=12, pady=7, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left", padx=(0, 6))
         self.watch_btn = tk.Button(top_bar, text="Watch Folder: OFF", command=self._toggle_watch_folder, **btn_gray)
         self.watch_btn.pack(side="left", padx=(0, 10))
 
@@ -338,15 +346,15 @@ class VRAutoTrimmerApp(_BASE_TK):
         self.tree.heading("audio", text="Audio")
         self.tree.heading("status", text="Status")
 
-        self.tree.column("file", width=195)
-        self.tree.column("duration", width=65, anchor="center")
-        self.tree.column("start", width=65, anchor="center")
-        self.tree.column("end", width=65, anchor="center")
-        self.tree.column("kept", width=65, anchor="center")
-        self.tree.column("trimmed", width=80, anchor="center")
-        self.tree.column("metrics", width=98, anchor="center")
-        self.tree.column("audio", width=85, anchor="center")
-        self.tree.column("status", width=100, anchor="center")
+        self.tree.column("file", width=175, minwidth=120, stretch=True)
+        self.tree.column("duration", width=68, minwidth=60, anchor="center", stretch=False)
+        self.tree.column("start", width=68, minwidth=60, anchor="center", stretch=False)
+        self.tree.column("end", width=68, minwidth=60, anchor="center", stretch=False)
+        self.tree.column("kept", width=68, minwidth=60, anchor="center", stretch=False)
+        self.tree.column("trimmed", width=88, minwidth=75, anchor="center", stretch=False)
+        self.tree.column("metrics", width=104, minwidth=90, anchor="center", stretch=False)
+        self.tree.column("audio", width=84, minwidth=70, anchor="center", stretch=False)
+        self.tree.column("status", width=105, minwidth=90, anchor="center", stretch=False)
         self.tree.tag_configure("metrics_warn", foreground="#f87171", background="#3b1518")
         self.tree.pack(side="top", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_select_queue_item)
@@ -619,30 +627,133 @@ class VRAutoTrimmerApp(_BASE_TK):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _pull_from_quest_async(self, latest_only: bool = False) -> None:
-        dest_dir = os.path.join(self.output_dir, "Quest_Pulls")
-        self._start_loading_ui("Connecting to Meta Quest over USB (ADB)...")
+    def _on_close(self) -> None:
+        try:
+            shutil.rmtree(self._quest_temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self.destroy()
+
+    def _browse_quest_videos_async(self) -> None:
+        self._start_loading_ui("Listing videos in Quest Oculus > VideoShots (no files copied)...")
+
+        def worker() -> None:
+            try:
+                items = list_quest_videos_adb(
+                    progress_cb=lambda msg: self.after(0, lambda m=msg: self._update_loading_ui(m, 40.0))
+                )
+                self.after(0, self._stop_loading_ui)
+                self.after(0, lambda it=items: self._open_quest_picker_dialog(it))
+            except Exception as exc:
+                self.after(0, self._stop_loading_ui)
+                self.after(0, lambda e=exc: messagebox.showwarning("Quest USB", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_quest_picker_dialog(self, items: List[tuple]) -> None:
+        if not items:
+            messagebox.showinfo("Quest VideoShots", "No .mp4 videos found in /sdcard/Oculus/VideoShots.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Quest Oculus > VideoShots ({len(items)} videos — browse only, no copy)")
+        win.geometry("620x460")
+        win.configure(bg="#111827")
+
+        tk.Label(
+            win,
+            text="Select video(s) to load for trimming (loaded temporarily — no permanent copy saved):",
+            bg="#111827",
+            fg="#e5e7eb",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 6))
+
+        frame = tk.Frame(win, bg="#111827")
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        lb = tk.Listbox(
+            frame,
+            selectmode="extended",
+            bg="#1f2937",
+            fg="#f3f4f6",
+            selectbackground="#2563eb",
+            font=("Segoe UI", 9),
+            relief="flat",
+        )
+        sb = ttk.Scrollbar(frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        for idx, (fname, sz) in enumerate(items):
+            tag = "  [LATEST]" if idx == 0 else ""
+            sz_txt = f"  ({sz})" if sz else ""
+            lb.insert("end", f"{fname}{sz_txt}{tag}")
+        lb.selection_set(0)
+
+        btn_row = tk.Frame(win, bg="#111827")
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        def load_selected() -> None:
+            sel = lb.curselection()
+            if not sel:
+                return
+            chosen = [items[i][0] for i in sel]
+            win.destroy()
+            self._load_quest_files_temp_async(chosen)
+
+        def load_latest() -> None:
+            win.destroy()
+            self._load_quest_files_temp_async([items[0][0]])
+
+        tk.Button(btn_row, text="Load Latest Only", command=load_latest, bg="#7c3aed", fg="#ffffff", relief="flat", padx=12, pady=6, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left")
+        tk.Button(btn_row, text="Load Selected Video(s)", command=load_selected, bg="#059669", fg="#ffffff", relief="flat", padx=12, pady=6, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right")
+        tk.Button(btn_row, text="Cancel", command=win.destroy, bg="#374151", fg="#f9fafb", relief="flat", padx=10, pady=6, font=("Segoe UI", 9), cursor="hand2").pack(side="right", padx=(0, 8))
+
+    def _load_quest_files_temp_async(self, filenames: List[str]) -> None:
+        self._start_loading_ui(f"Loading {len(filenames)} video(s) from Quest (temp only)...")
+
+        def worker() -> None:
+            try:
+                pulled = pull_quest_files_adb(
+                    filenames,
+                    self._quest_temp_dir,
+                    progress_cb=lambda msg: self.after(0, lambda m=msg: self._update_loading_ui(m, 50.0)),
+                )
+                def on_done() -> None:
+                    self._stop_loading_ui()
+                    if pulled:
+                        self.status_var.set(f"Loaded {len(pulled)} video(s) from Quest (temp cache, auto-cleaned on exit).")
+                        self._enqueue_video_paths(pulled)
+                self.after(0, on_done)
+            except Exception as exc:
+                self.after(0, self._stop_loading_ui)
+                self.after(0, lambda e=exc: messagebox.showwarning("Quest USB", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pull_from_quest_async(self, latest_only: bool = True) -> None:
+        self._start_loading_ui("Loading latest video from Quest (temp only)...")
 
         def worker() -> None:
             try:
                 pulled = pull_from_quest_adb(
-                    dest_dir,
-                    latest_only=latest_only,
+                    self._quest_temp_dir,
+                    latest_only=True,
                     progress_cb=lambda msg: self.after(0, lambda m=msg: self._update_loading_ui(m, 50.0)),
                 )
                 def on_done() -> None:
                     self._stop_loading_ui()
                     self._poll_quest_status_async(manual=True)
                     if pulled:
-                        self.status_var.set(f"Pulled {len(pulled)} video(s) from Quest.")
+                        self.status_var.set("Loaded latest Quest video (temp cache, auto-cleaned on exit).")
                         self._enqueue_video_paths(pulled)
                     else:
-                        self.status_var.set("Quest connected — no new recordings to pull.")
-                        messagebox.showinfo("Quest Pull", f"No new .mp4 recordings found on Quest.\n(Already downloaded clips are in {dest_dir})")
+                        self.status_var.set("Quest connected — no videos found in Oculus > VideoShots.")
+                        messagebox.showinfo("Quest USB", "No .mp4 recordings found in /sdcard/Oculus/VideoShots.")
                 self.after(0, on_done)
             except Exception as exc:
                 self.after(0, self._stop_loading_ui)
-                self.after(0, lambda e=exc: messagebox.showwarning("Quest USB Pull", str(e)))
+                self.after(0, lambda e=exc: messagebox.showwarning("Quest USB", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
