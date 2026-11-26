@@ -233,7 +233,7 @@ class VRAutoTrimmerApp(tk.Tk):
         left_col = tk.Frame(body, bg="#111827")
         left_col.pack(side="left", fill="both", expand=True)
 
-        cols = ("file", "duration", "start", "end", "kept", "trimmed", "status")
+        cols = ("file", "duration", "start", "end", "kept", "trimmed", "metrics", "status")
         self.tree = ttk.Treeview(left_col, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("file", text="Video File")
         self.tree.heading("duration", text="Original")
@@ -241,6 +241,7 @@ class VRAutoTrimmerApp(tk.Tk):
         self.tree.heading("end", text="End")
         self.tree.heading("kept", text="Kept")
         self.tree.heading("trimmed", text="Time Trimmed")
+        self.tree.heading("metrics", text="Metrics")
         self.tree.heading("status", text="Status")
 
         self.tree.column("file", width=220)
@@ -248,8 +249,10 @@ class VRAutoTrimmerApp(tk.Tk):
         self.tree.column("start", width=70, anchor="center")
         self.tree.column("end", width=70, anchor="center")
         self.tree.column("kept", width=70, anchor="center")
-        self.tree.column("trimmed", width=90, anchor="center")
-        self.tree.column("status", width=115, anchor="center")
+        self.tree.column("trimmed", width=85, anchor="center")
+        self.tree.column("metrics", width=105, anchor="center")
+        self.tree.column("status", width=110, anchor="center")
+        self.tree.tag_configure("metrics_warn", foreground="#f87171", background="#3b1518")
         self.tree.pack(side="top", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_select_queue_item)
 
@@ -269,7 +272,18 @@ class VRAutoTrimmerApp(tk.Tk):
         preview_panel.pack(side="right", fill="y", padx=(10, 0))
         preview_panel.pack_propagate(False)
 
-        tk.Label(preview_panel, text="Cut Preview", bg="#1f2937", fg="#f9fafb", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        tk.Label(preview_panel, text="Cut Preview", bg="#1f2937", fg="#f9fafb", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        self.metrics_warn_lbl = tk.Label(
+            preview_panel,
+            text="⚠ WARNING: OVR Metrics overlay shown throughout video!",
+            bg="#7f1d1d",
+            fg="#fecaca",
+            font=("Segoe UI", 8, "bold"),
+            wraplength=245,
+            justify="left",
+            padx=8,
+            pady=5,
+        )
 
         tk.Label(preview_panel, text="Start Frame (click to enlarge):", bg="#1f2937", fg="#93c5fd", font=("Segoe UI", 9)).pack(anchor="w")
         self.start_thumb_lbl = tk.Label(preview_panel, bg="#0f172a", width=240, height=155, cursor="hand2")
@@ -403,7 +417,7 @@ class VRAutoTrimmerApp(tk.Tk):
                     _, dur, _ = get_video_info(p)
                 except Exception:
                     dur = 0.0
-                self.tree.insert("", "end", iid=p, values=(os.path.basename(p), fmt_time(dur), "-", "-", "-", "-", "Queued"))
+                self.tree.insert("", "end", iid=p, values=(os.path.basename(p), fmt_time(dur), "-", "-", "-", "-", "-", "Queued"))
         if added:
             self._analyze_paths_async(added)
 
@@ -422,7 +436,7 @@ class VRAutoTrimmerApp(tk.Tk):
                         _, dur, _ = get_video_info(p)
                     except Exception:
                         dur = 0.0
-                    self.tree.insert("", "end", iid=p, values=(name, fmt_time(dur), "-", "-", "-", "-", "Queued"))
+                    self.tree.insert("", "end", iid=p, values=(name, fmt_time(dur), "-", "-", "-", "-", "-", "Queued"))
         if added:
             self._analyze_paths_async(added)
 
@@ -514,8 +528,10 @@ class VRAutoTrimmerApp(tk.Tk):
                                 fmt_time(r.end_time),
                                 fmt_time(k),
                                 fmt_time(tr),
+                                "⚠ METRICS ON" if r.has_metrics_overlay else "Clean",
                                 "Ready to Export",
                             ),
+                            tags=("metrics_warn",) if r.has_metrics_overlay else (),
                         ),
                     )
                 except Exception as exc:
@@ -530,13 +546,29 @@ class VRAutoTrimmerApp(tk.Tk):
                     total_kept = sum(max(0.0, r.end_time - r.start_time) for r in self.detections.values())
                     total_orig = sum(r.duration for r in self.detections.values())
                     total_trim = max(0.0, total_orig - total_kept)
-                    messagebox.showinfo(
-                        "Analysis Finished",
-                        f"Finished analyzing {analyzed_count} video(s).\n\n"
-                        f"Trimmed Total Duration: {fmt_time(total_kept)}\n"
-                        f"Total Time Removed: {fmt_time(total_trim)}\n\n"
-                        "Check the Cut Preview on the right, then click 'Auto-Trim & Export All'.",
+                    warn_vids = [os.path.basename(k) for k, r in self.detections.items() if r.has_metrics_overlay]
+                    warn_note = (
+                        f"\n\n⚠ WARNING: OVR Metrics overlay detected in {len(warn_vids)} video(s):\n• "
+                        + "\n• ".join(warn_vids)
+                        if warn_vids
+                        else ""
                     )
+                    if warn_vids:
+                        messagebox.showwarning(
+                            "Analysis Finished — Metrics Warning",
+                            f"Finished analyzing {analyzed_count} video(s).\n\n"
+                            f"Trimmed Total Duration: {fmt_time(total_kept)}\n"
+                            f"Total Time Removed: {fmt_time(total_trim)}"
+                            f"{warn_note}",
+                        )
+                    else:
+                        messagebox.showinfo(
+                            "Analysis Finished",
+                            f"Finished analyzing {analyzed_count} video(s).\n\n"
+                            f"Trimmed Total Duration: {fmt_time(total_kept)}\n"
+                            f"Total Time Removed: {fmt_time(total_trim)}\n\n"
+                            "Check the Cut Preview on the right, then click 'Auto-Trim & Export All'.",
+                        )
 
             self.after(0, finish)
 
@@ -623,8 +655,10 @@ class VRAutoTrimmerApp(tk.Tk):
                                     fmt_time(r.end_time),
                                     fmt_time(k),
                                     fmt_time(tr),
+                                    "⚠ METRICS ON" if r.has_metrics_overlay else "Clean",
                                     "Exporting...",
                                 ),
+                                tags=("metrics_warn",) if r.has_metrics_overlay else (),
                             ),
                         )
                     else:
@@ -719,6 +753,12 @@ class VRAutoTrimmerApp(tk.Tk):
         if p not in self.detections:
             return
         res = self.detections[p]
+        if res.has_metrics_overlay:
+            if not self.metrics_warn_lbl.winfo_ismapped():
+                self.metrics_warn_lbl.pack(fill="x", pady=(0, 8), before=self.start_thumb_lbl.master.winfo_children()[2])
+        else:
+            if self.metrics_warn_lbl.winfo_ismapped():
+                self.metrics_warn_lbl.pack_forget()
         self.adj_start_var.set(f"{res.start_time:.2f}")
         self.adj_end_var.set(f"{res.end_time:.2f}")
         self._load_thumb(p, res.start_time, is_start=True)
@@ -798,8 +838,10 @@ class VRAutoTrimmerApp(tk.Tk):
                     fmt_time(res.end_time),
                     fmt_time(res.end_time - res.start_time),
                     fmt_time(max(0.0, res.duration - (res.end_time - res.start_time))),
+                    "⚠ METRICS ON" if res.has_metrics_overlay else "Clean",
                     "Adjusted",
                 ),
+                tags=("metrics_warn",) if res.has_metrics_overlay else (),
             )
             self._load_thumb(p, res.start_time, is_start=True)
             self._load_thumb(p, max(0.0, res.end_time - 0.1), is_start=False)

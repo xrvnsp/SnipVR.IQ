@@ -20,6 +20,8 @@ class DetectionResult:
     black_fades: List[Tuple[float, float]]
     confidence_start: float
     confidence_end: float
+    has_metrics_overlay: bool = False
+    metrics_coverage: float = 0.0
 
 
 def find_ffmpeg(custom_path: Optional[str] = None) -> str:
@@ -92,6 +94,15 @@ def extract_frame_features(frame: np.ndarray) -> np.ndarray:
     if norm > 1e-6:
         vec /= norm
     return vec
+
+
+def has_ovr_metrics_hud(frame: np.ndarray) -> bool:
+    """Detect OVR Metrics Tool neon-green HUD text pinned in the top-center band."""
+    h, w = frame.shape[:2]
+    roi = frame[0 : max(1, int(h * 0.16)), int(w * 0.30) : int(w * 0.72)]
+    b, g, r = cv2.split(roi)
+    neon_green = (g > 150) & (g.astype(np.int16) - r.astype(np.int16) > 60) & (g.astype(np.int16) - b.astype(np.int16) > 60)
+    return float(neon_green.mean()) > 0.0012
 
 
 def get_video_info(video_path: str) -> Tuple[float, float, int]:
@@ -259,6 +270,7 @@ def detect_trim_points(
 
     times: List[float] = []
     scores: List[float] = []
+    metrics_samples: List[Tuple[float, bool]] = []
     use_model = model is not None and model.is_trained()
 
     frame_idx = 0
@@ -290,6 +302,8 @@ def detect_trim_points(
                 if need_cls:
                     times.append(t)
                     scores.append(model.score_frame(frame))
+                    if len(times) % 5 == 0:
+                        metrics_samples.append((t, has_ovr_metrics_hud(frame)))
                     if progress_cb and len(times) % 15 == 0:
                         progress_cb(f"Analyzing {os.path.basename(video_path)}: {t:.1f}s / {duration:.1f}s")
         if frame_progress_cb and (frame_idx % 15 == 0):
@@ -371,6 +385,12 @@ def detect_trim_points(
     start_time = max(0.0, min(start_time, duration))
     end_time = max(start_time + 0.1, min(end_time, duration))
 
+    kept_metrics = [flag for t_m, flag in metrics_samples if start_time <= t_m <= end_time]
+    if not kept_metrics:
+        kept_metrics = [flag for _, flag in metrics_samples]
+    metrics_cov = float(sum(kept_metrics) / len(kept_metrics)) if kept_metrics else 0.0
+    has_metrics = metrics_cov >= 0.40
+
     return DetectionResult(
         video_path=video_path,
         duration=duration,
@@ -380,6 +400,8 @@ def detect_trim_points(
         black_fades=black_fades,
         confidence_start=round(conf_start, 2),
         confidence_end=round(conf_end, 2),
+        has_metrics_overlay=has_metrics,
+        metrics_coverage=round(metrics_cov, 2),
     )
 
 
@@ -415,16 +437,27 @@ def trim_video_ffmpeg(
     else:
         base_cmd += ["-c", "copy"]
 
-    cmd = base_cmd + ["-progress", "pipe:1", "-nostats", output_path]
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "bufsize": 1}
+    cmd = base_cmd + ["-progress", "pipe:1", "-nostats", "-loglevel", "warning", output_path]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
     proc = subprocess.Popen(cmd, **kwargs)
+    tail_logs: List[str] = []
     if proc.stdout:
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("out_time_us="):
                 try:
                     val = int(line.split("=", 1)[1])
                     pct = min(100.0, max(0.0, (val / 1_000_000.0) / duration * 100.0))
@@ -432,9 +465,23 @@ def trim_video_ffmpeg(
                         progress_cb(pct)
                 except ValueError:
                     pass
+            elif line.startswith("out_time="):
+                try:
+                    parts = line.split("=", 1)[1].split(":")
+                    if len(parts) == 3:
+                        sec_val = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                        pct = min(100.0, max(0.0, (sec_val / duration) * 100.0))
+                        if progress_cb:
+                            progress_cb(pct)
+                except ValueError:
+                    pass
             elif line == "progress=end" and progress_cb:
                 progress_cb(100.0)
+            elif "=" not in line:
+                tail_logs.append(line)
+                if len(tail_logs) > 25:
+                    tail_logs.pop(0)
 
-    _, err = proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed:\n{(err or '')[-800:]}")
+    ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError("FFmpeg failed:\n" + "\n".join(tail_logs[-15:]))
