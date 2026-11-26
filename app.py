@@ -150,7 +150,6 @@ class VRAutoTrimmerApp(tk.Tk):
         tk.Button(top_bar, text="Clear", command=self._clear_queue, **btn_gray).pack(side="left", padx=(0, 14))
 
         tk.Button(top_bar, text="Auto-Trim & Export All", command=self._trim_all_async, **btn_green).pack(side="right")
-        tk.Button(top_bar, text="Preview Cuts", command=self._analyze_all_async, bg="#d97706", fg="#ffffff", relief="flat", padx=12, pady=7, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right", padx=(0, 8))
 
         # Export destination bar
         exp_bar = tk.Frame(self.trim_tab, bg="#1f2937", padx=10, pady=8)
@@ -332,29 +331,37 @@ class VRAutoTrimmerApp(tk.Tk):
             title="Select VR Video(s)",
             filetypes=[("Video files", "*.mp4 *.mov *.mkv *.avi"), ("All files", "*.*")],
         )
+        added: List[str] = []
         for p in paths:
             if p not in self.queue_paths:
                 self.queue_paths.append(p)
+                added.append(p)
                 try:
                     _, dur, _ = get_video_info(p)
                 except Exception:
                     dur = 0.0
                 self.tree.insert("", "end", iid=p, values=(os.path.basename(p), fmt_time(dur), "-", "-", "-", "-", "Queued"))
+        if added:
+            self._analyze_paths_async(added)
 
     def _add_folder(self) -> None:
         folder = filedialog.askdirectory(title="Select Folder of VR Videos")
         if not folder:
             return
+        added: List[str] = []
         for name in sorted(os.listdir(folder)):
             if name.lower().endswith((".mp4", ".mov", ".mkv", ".avi")):
                 p = os.path.join(folder, name)
                 if p not in self.queue_paths:
                     self.queue_paths.append(p)
+                    added.append(p)
                     try:
                         _, dur, _ = get_video_info(p)
                     except Exception:
                         dur = 0.0
                     self.tree.insert("", "end", iid=p, values=(name, fmt_time(dur), "-", "-", "-", "-", "Queued"))
+        if added:
+            self._analyze_paths_async(added)
 
     def _update_total_duration(self) -> None:
         total_orig = sum(r.duration for r in self.detections.values())
@@ -382,13 +389,12 @@ class VRAutoTrimmerApp(tk.Tk):
         if os.name == "nt":
             os.startfile(self.output_dir)
 
-    def _analyze_all_async(self) -> None:
-        if not self.queue_paths:
-            messagebox.showinfo("No Videos", "Add at least one video first.")
+    def _analyze_paths_async(self, paths: List[str]) -> None:
+        if not paths:
             return
 
         def worker() -> None:
-            for p in list(self.queue_paths):
+            for p in list(paths):
                 self.after(0, lambda p=p: self.tree.set(p, "status", "Analyzing..."))
                 try:
                     res = detect_trim_points(
