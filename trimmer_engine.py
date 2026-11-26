@@ -552,8 +552,13 @@ def check_audio_status(
     return False, "OK", round(mean_db, 1)
 
 
+def _adb_cache_dir() -> str:
+    base_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base_dir, "SnipVR.IQ", "platform_tools")
+
+
 def find_adb() -> Optional[str]:
-    """Locate bundled adb.exe (PyInstaller _MEIPASS, app folder, platform_tools, or PATH)."""
+    """Locate bundled or cached adb.exe (PyInstaller _MEIPASS, app folder, LocalAppData cache, or PATH)."""
     search_paths = []
     if getattr(sys, "frozen", False):
         if hasattr(sys, "_MEIPASS"):
@@ -565,6 +570,7 @@ def find_adb() -> Optional[str]:
     search_paths.extend([
         os.path.join(app_dir, "adb.exe"),
         os.path.join(app_dir, "platform_tools", "adb.exe"),
+        os.path.join(_adb_cache_dir(), "adb.exe"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe"),
         r"C:\Program Files\Meta Quest Developer Hub\resources\bin\adb.exe",
         r"C:\platform-tools\adb.exe",
@@ -578,18 +584,46 @@ def find_adb() -> Optional[str]:
     return None
 
 
-def pull_from_quest_adb(
-    dest_dir: str,
-    progress_cb: Optional[Callable[[str], None]] = None,
-) -> List[str]:
-    """Pull new .mp4 recordings from a USB-connected Meta Quest (/sdcard/Oculus/VideoShots/)."""
-    adb = find_adb()
-    if not adb:
+def ensure_adb(progress_cb: Optional[Callable[[str], None]] = None) -> str:
+    """Return path to adb.exe, automatically downloading Google Platform-Tools on Windows if missing."""
+    existing = find_adb()
+    if existing:
+        return existing
+    if os.name != "nt":
+        raise RuntimeError("ADB not found in PATH.")
+
+    import io
+    import urllib.request
+    import zipfile
+
+    cache_dir = _adb_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    url = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+    if progress_cb:
+        progress_cb("Downloading Google ADB Platform-Tools (one-time setup)...")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for member in zf.namelist():
+                base_name = os.path.basename(member)
+                if base_name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+                    target = os.path.join(cache_dir, base_name)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+    except Exception as exc:
         raise RuntimeError(
-            "ADB (Android Debug Bridge) was not found.\n\n"
-            "Install Android Platform Tools (or Meta Quest Developer Hub) and ensure adb.exe is in PATH or next to SnipVR.IQ.exe."
+            f"Could not auto-download ADB ({exc}).\n\n"
+            "Check your internet connection or place adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll next to SnipVR.IQ.exe."
         )
 
+    adb_exe = os.path.join(cache_dir, "adb.exe")
+    if not os.path.isfile(adb_exe):
+        raise RuntimeError("ADB download completed but adb.exe was not found in archive.")
+    return adb_exe
+
+
+def _adb_run_kwargs() -> dict:
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -600,6 +634,49 @@ def pull_from_quest_adb(
     }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return kwargs
+
+
+def get_quest_status(auto_download_adb: bool = False, progress_cb: Optional[Callable[[str], None]] = None) -> dict:
+    """
+    Check if a Meta Quest is connected over USB and return the latest video in /sdcard/Oculus/VideoShots.
+    Returns dict: {adb_ready, connected, device_id, latest_video, total_videos, error}.
+    """
+    adb = ensure_adb(progress_cb=progress_cb) if auto_download_adb else find_adb()
+    if not adb:
+        return {"adb_ready": False, "connected": False, "device_id": None, "latest_video": None, "total_videos": 0, "error": None}
+
+    kwargs = _adb_run_kwargs()
+    try:
+        dev_res = subprocess.run([adb, "devices"], **kwargs, timeout=10)
+        lines = [l.strip() for l in (dev_res.stdout or "").splitlines()[1:] if l.strip()]
+        connected = [l.split()[0] for l in lines if l.endswith("\tdevice") or " device" in l]
+        if not connected:
+            return {"adb_ready": True, "connected": False, "device_id": None, "latest_video": None, "total_videos": 0, "error": None}
+
+        remote_dir = "/sdcard/Oculus/VideoShots"
+        ls_res = subprocess.run([adb, "shell", f"ls -1t {remote_dir}"], **kwargs, timeout=10)
+        mp4s = [f.strip() for f in (ls_res.stdout or "").splitlines() if f.strip().lower().endswith(".mp4")]
+        return {
+            "adb_ready": True,
+            "connected": True,
+            "device_id": connected[0],
+            "latest_video": mp4s[0] if mp4s else None,
+            "total_videos": len(mp4s),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"adb_ready": True, "connected": False, "device_id": None, "latest_video": None, "total_videos": 0, "error": str(exc)}
+
+
+def pull_from_quest_adb(
+    dest_dir: str,
+    latest_only: bool = False,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    """Pull latest or all new .mp4 recordings from a USB-connected Meta Quest (/sdcard/Oculus/VideoShots/)."""
+    adb = ensure_adb(progress_cb=progress_cb)
+    kwargs = _adb_run_kwargs()
 
     dev_res = subprocess.run([adb, "devices"], **kwargs, timeout=15)
     lines = [l.strip() for l in (dev_res.stdout or "").splitlines()[1:] if l.strip()]
@@ -612,7 +689,7 @@ def pull_from_quest_adb(
         )
 
     remote_dir = "/sdcard/Oculus/VideoShots"
-    ls_res = subprocess.run([adb, "shell", f"ls -1 {remote_dir}"], **kwargs, timeout=15)
+    ls_res = subprocess.run([adb, "shell", f"ls -1t {remote_dir}"], **kwargs, timeout=15)
     remote_files = [
         f.strip()
         for f in (ls_res.stdout or "").splitlines()
@@ -621,14 +698,15 @@ def pull_from_quest_adb(
     if not remote_files:
         return []
 
+    targets = [remote_files[0]] if latest_only else remote_files
     os.makedirs(dest_dir, exist_ok=True)
     pulled: List[str] = []
-    for idx, fname in enumerate(remote_files, start=1):
+    for idx, fname in enumerate(targets, start=1):
         local_path = os.path.join(dest_dir, fname)
-        if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+        if not latest_only and os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
             continue
         if progress_cb:
-            progress_cb(f"Pulling from Quest ({idx}/{len(remote_files)}): {fname}...")
+            progress_cb(f"Pulling from Quest ({idx}/{len(targets)}): {fname}...")
         pull_res = subprocess.run([adb, "pull", f"{remote_dir}/{fname}", local_path], **kwargs, timeout=180)
         if pull_res.returncode == 0 and os.path.isfile(local_path):
             pulled.append(local_path)

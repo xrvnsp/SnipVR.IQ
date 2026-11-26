@@ -87,7 +87,8 @@ $PyInstArgs = @(
     "--icon", "app_icon.ico",
     "--add-data", "app_icon.ico;.",
     "--add-data", "default_model.npz;.",
-    "--collect-binaries", "imageio_ffmpeg"
+    "--collect-binaries", "imageio_ffmpeg",
+    "--collect-all", "tkinterdnd2"
 )
 foreach ($f in @("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")) {
     $fp = Join-Path $AdbDir $f

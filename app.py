@@ -26,69 +26,20 @@ from trimmer_engine import (
     DetectionResult,
     TrainableTrimModel,
     detect_trim_points,
+    get_quest_status,
     get_video_info,
     pull_from_quest_adb,
     trim_video_ffmpeg,
 )
 
-def install_win64_drop_handler(tk_root: tk.Tk, callback) -> None:
-    """64-bit-safe Windows WM_DROPFILES hook using ctypes (replaces windnd, prevents access violations)."""
-    if os.name != "nt":
-        return
-    from ctypes import wintypes
-
-    WM_DROPFILES = 0x0233
-    GWLP_WNDPROC = -4
-    LRESULT = ctypes.c_ssize_t
-    WPARAM = ctypes.c_size_t
-    LPARAM = ctypes.c_ssize_t
-    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
-
-    user32 = ctypes.windll.user32
-    shell32 = ctypes.windll.shell32
-
-    user32.GetParent.argtypes = [wintypes.HWND]
-    user32.GetParent.restype = wintypes.HWND
-    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-    user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
-    user32.CallWindowProcW.restype = LRESULT
-
-    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-    shell32.DragAcceptFiles.restype = None
-    shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-    shell32.DragQueryFileW.restype = wintypes.UINT
-    shell32.DragFinish.argtypes = [ctypes.c_void_p]
-    shell32.DragFinish.restype = None
-
-    tk_root.update_idletasks()
-    hwnd = user32.GetParent(tk_root.winfo_id()) or tk_root.winfo_id()
-    shell32.DragAcceptFiles(hwnd, True)
-
-    old_proc_holder = [None]
-
-    def py_wndproc(h, msg, wparam, lparam):
-        if msg == WM_DROPFILES:
-            hdrop = ctypes.c_void_p(wparam)
-            try:
-                count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                paths = []
-                for i in range(count):
-                    length = shell32.DragQueryFileW(hdrop, i, None, 0)
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    shell32.DragQueryFileW(hdrop, i, buf, length + 1)
-                    if buf.value:
-                        paths.append(buf.value)
-                if paths:
-                    tk_root.after(0, lambda p=paths: callback(p))
-            finally:
-                shell32.DragFinish(hdrop)
-            return 0
-        return user32.CallWindowProcW(old_proc_holder[0], h, msg, wparam, lparam)
-
-    new_proc = WNDPROC(py_wndproc)
-    tk_root._win64_drop_proc_ref = new_proc  # prevent GC!
-    old_proc_holder[0] = user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _BASE_TK = TkinterDnD.Tk
+    _HAS_TKDND = True
+except Exception:
+    DND_FILES = None
+    _BASE_TK = tk.Tk
+    _HAS_TKDND = False
 
 
 def fmt_time(sec: float) -> str:
@@ -97,7 +48,7 @@ def fmt_time(sec: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
-class VRAutoTrimmerApp(tk.Tk):
+class VRAutoTrimmerApp(_BASE_TK):
     def __init__(self) -> None:
         super().__init__()
         self.title("SnipVR.IQ")
@@ -173,10 +124,13 @@ class VRAutoTrimmerApp(tk.Tk):
         self._setup_styles()
         self._build_ui()
         self._refresh_model_status()
-        try:
-            install_win64_drop_handler(self, self._on_drop_files)
-        except Exception:
-            pass
+        self.after(800, self._poll_quest_status_async)
+        if _HAS_TKDND and DND_FILES is not None:
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_tkdnd_drop)
+            except Exception:
+                pass
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self)
@@ -296,6 +250,46 @@ class VRAutoTrimmerApp(tk.Tk):
         tk.Button(exp_bar, text="Change Folder...", command=self._choose_output_dir, bg="#374151", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=(0, 6))
         tk.Button(exp_bar, text="Open Export Folder", command=self._open_output_dir, bg="#374151", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9), cursor="hand2").pack(side="left")
         tk.Button(exp_bar, text="Export Selected As...", command=self._export_selected_as, bg="#1d4ed8", fg="#ffffff", relief="flat", padx=10, pady=3, font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right")
+
+        # Quest USB Live Status Bar (shows connected Quest + latest video in Oculus > VideoShots)
+        quest_bar = tk.Frame(self.trim_tab, bg="#172033", padx=10, pady=6, highlightbackground="#334155", highlightthickness=1)
+        quest_bar.pack(fill="x", pady=(0, 8))
+
+        self.quest_status_lbl = tk.Label(
+            quest_bar,
+            text="Quest USB: Checking...",
+            bg="#172033",
+            fg="#94a3b8",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.quest_status_lbl.pack(side="left")
+
+        self.pull_latest_btn = tk.Button(
+            quest_bar,
+            text="Pull Latest Video",
+            command=lambda: self._pull_from_quest_async(latest_only=True),
+            bg="#7c3aed",
+            fg="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            state="disabled",
+        )
+        self.pull_latest_btn.pack(side="right")
+        tk.Button(
+            quest_bar,
+            text="Refresh Quest",
+            command=lambda: self._poll_quest_status_async(manual=True),
+            bg="#374151",
+            fg="#f9fafb",
+            relief="flat",
+            padx=10,
+            pady=3,
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        ).pack(side="right", padx=(0, 6))
 
         # Live Analysis Loading Bar (shown while analyzing)
         self.loading_bar_frame = tk.Frame(self.trim_tab, bg="#1e293b", padx=12, pady=8, highlightbackground="#3b82f6", highlightthickness=1)
@@ -531,18 +525,17 @@ class VRAutoTrimmerApp(tk.Tk):
         if added:
             self._analyze_paths_async(added)
 
-    def _on_drop_files(self, files) -> None:
-        decoded: List[str] = []
-        for item in files:
-            if isinstance(item, bytes):
-                try:
-                    decoded.append(item.decode("utf-8"))
-                except UnicodeDecodeError:
-                    decoded.append(item.decode("mbcs", errors="ignore"))
-            else:
-                decoded.append(str(item))
-        if decoded:
-            self.after(0, lambda d=decoded: self._enqueue_video_paths(d))
+    def _on_tkdnd_drop(self, event) -> None:
+        raw = getattr(event, "data", "")
+        if not raw:
+            return
+        try:
+            paths = list(self.tk.splitlist(raw))
+        except Exception:
+            paths = [raw]
+        cleaned = [p.strip().strip("{}") for p in paths if p and p.strip()]
+        if cleaned:
+            self.after(0, lambda d=cleaned: self._enqueue_video_paths(d))
 
     def _toggle_watch_folder(self) -> None:
         if self.watch_folder:
@@ -588,7 +581,45 @@ class VRAutoTrimmerApp(tk.Tk):
         if self.watch_folder:
             self.after(2500, self._poll_watch_folder)
 
-    def _pull_from_quest_async(self) -> None:
+    def _poll_quest_status_async(self, manual: bool = False) -> None:
+        def worker() -> None:
+            try:
+                info = get_quest_status(
+                    auto_download_adb=manual,
+                    progress_cb=(lambda msg: self.after(0, lambda m=msg: self.status_var.set(m))) if manual else None,
+                )
+            except Exception as exc:
+                info = {"adb_ready": False, "connected": False, "device_id": None, "latest_video": None, "total_videos": 0, "error": str(exc)}
+
+            def apply_ui() -> None:
+                if info.get("connected"):
+                    latest = info.get("latest_video") or "None found"
+                    total_v = info.get("total_videos", 0)
+                    self.quest_status_lbl.config(
+                        text=f"● Quest Connected  |  Last in Oculus > VideoShots ({total_v}): {latest}",
+                        fg="#86efac",
+                    )
+                    self.pull_latest_btn.config(state="normal" if info.get("latest_video") else "disabled")
+                elif not info.get("adb_ready"):
+                    self.quest_status_lbl.config(
+                        text="Quest USB: Click 'Refresh Quest' or 'Pull from Quest (USB)' to auto-setup ADB",
+                        fg="#94a3b8",
+                    )
+                    self.pull_latest_btn.config(state="disabled")
+                else:
+                    self.quest_status_lbl.config(
+                        text="○ Quest Not Detected over USB (connect USB & allow debugging inside headset)",
+                        fg="#94a3b8",
+                    )
+                    self.pull_latest_btn.config(state="disabled")
+
+            self.after(0, apply_ui)
+            if not manual:
+                self.after(8000, self._poll_quest_status_async)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pull_from_quest_async(self, latest_only: bool = False) -> None:
         dest_dir = os.path.join(self.output_dir, "Quest_Pulls")
         self._start_loading_ui("Connecting to Meta Quest over USB (ADB)...")
 
@@ -596,12 +627,14 @@ class VRAutoTrimmerApp(tk.Tk):
             try:
                 pulled = pull_from_quest_adb(
                     dest_dir,
+                    latest_only=latest_only,
                     progress_cb=lambda msg: self.after(0, lambda m=msg: self._update_loading_ui(m, 50.0)),
                 )
                 def on_done() -> None:
                     self._stop_loading_ui()
+                    self._poll_quest_status_async(manual=True)
                     if pulled:
-                        self.status_var.set(f"Pulled {len(pulled)} new video(s) from Quest.")
+                        self.status_var.set(f"Pulled {len(pulled)} video(s) from Quest.")
                         self._enqueue_video_paths(pulled)
                     else:
                         self.status_var.set("Quest connected — no new recordings to pull.")
