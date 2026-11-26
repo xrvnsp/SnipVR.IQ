@@ -553,21 +553,28 @@ def check_audio_status(
 
 
 def find_adb() -> Optional[str]:
-    """Locate adb executable on Windows/Linux."""
-    which_adb = shutil.which("adb")
-    if which_adb:
-        return which_adb
-    search_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "adb.exe"),
+    """Locate bundled adb.exe (PyInstaller _MEIPASS, app folder, platform_tools, or PATH)."""
+    search_paths = []
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            search_paths.append(os.path.join(sys._MEIPASS, "adb.exe"))
+        exe_dir = os.path.dirname(sys.executable)
+        search_paths.append(os.path.join(exe_dir, "adb.exe"))
+        search_paths.append(os.path.join(exe_dir, "platform_tools", "adb.exe"))
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    search_paths.extend([
+        os.path.join(app_dir, "adb.exe"),
+        os.path.join(app_dir, "platform_tools", "adb.exe"),
         os.path.join(os.path.expanduser("~"), "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe"),
         r"C:\Program Files\Meta Quest Developer Hub\resources\bin\adb.exe",
         r"C:\platform-tools\adb.exe",
-    ]
-    if getattr(sys, "frozen", False):
-        search_paths.insert(0, os.path.join(os.path.dirname(sys.executable), "adb.exe"))
+    ])
     for p in search_paths:
         if os.path.isfile(p):
             return p
+    which_adb = shutil.which("adb")
+    if which_adb:
+        return which_adb
     return None
 
 

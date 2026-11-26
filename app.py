@@ -31,10 +31,64 @@ from trimmer_engine import (
     trim_video_ffmpeg,
 )
 
-try:
-    import windnd
-except Exception:
-    windnd = None
+def install_win64_drop_handler(tk_root: tk.Tk, callback) -> None:
+    """64-bit-safe Windows WM_DROPFILES hook using ctypes (replaces windnd, prevents access violations)."""
+    if os.name != "nt":
+        return
+    from ctypes import wintypes
+
+    WM_DROPFILES = 0x0233
+    GWLP_WNDPROC = -4
+    LRESULT = ctypes.c_ssize_t
+    WPARAM = ctypes.c_size_t
+    LPARAM = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
+
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
+    user32.CallWindowProcW.restype = LRESULT
+
+    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+    shell32.DragAcceptFiles.restype = None
+    shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragQueryFileW.restype = wintypes.UINT
+    shell32.DragFinish.argtypes = [ctypes.c_void_p]
+    shell32.DragFinish.restype = None
+
+    tk_root.update_idletasks()
+    hwnd = user32.GetParent(tk_root.winfo_id()) or tk_root.winfo_id()
+    shell32.DragAcceptFiles(hwnd, True)
+
+    old_proc_holder = [None]
+
+    def py_wndproc(h, msg, wparam, lparam):
+        if msg == WM_DROPFILES:
+            hdrop = ctypes.c_void_p(wparam)
+            try:
+                count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+                paths = []
+                for i in range(count):
+                    length = shell32.DragQueryFileW(hdrop, i, None, 0)
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    shell32.DragQueryFileW(hdrop, i, buf, length + 1)
+                    if buf.value:
+                        paths.append(buf.value)
+                if paths:
+                    tk_root.after(0, lambda p=paths: callback(p))
+            finally:
+                shell32.DragFinish(hdrop)
+            return 0
+        return user32.CallWindowProcW(old_proc_holder[0], h, msg, wparam, lparam)
+
+    new_proc = WNDPROC(py_wndproc)
+    tk_root._win64_drop_proc_ref = new_proc  # prevent GC!
+    old_proc_holder[0] = user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
 
 
 def fmt_time(sec: float) -> str:
@@ -56,8 +110,12 @@ class VRAutoTrimmerApp(tk.Tk):
             except Exception:
                 dpi_scale = 1.0
         self._dpi_scale = dpi_scale
-        w_init, h_init = int(1040 * dpi_scale), int(720 * dpi_scale)
-        w_min, h_min = int(920 * dpi_scale), int(640 * dpi_scale)
+        scr_w = self.winfo_screenwidth()
+        scr_h = self.winfo_screenheight()
+        w_init = min(int(1080 * dpi_scale), max(880, scr_w - 60))
+        h_init = min(int(720 * dpi_scale), max(600, scr_h - 90))
+        w_min = min(int(920 * dpi_scale), w_init)
+        h_min = min(int(620 * dpi_scale), h_init)
         self.geometry(f"{w_init}x{h_init}")
         self.minsize(w_min, h_min)
         self.configure(bg="#111827")
@@ -115,11 +173,10 @@ class VRAutoTrimmerApp(tk.Tk):
         self._setup_styles()
         self._build_ui()
         self._refresh_model_status()
-        if windnd is not None:
-            try:
-                windnd.hook_dropfiles(self, func=self._on_drop_files)
-            except Exception:
-                pass
+        try:
+            install_win64_drop_handler(self, self._on_drop_files)
+        except Exception:
+            pass
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self)
@@ -143,13 +200,29 @@ class VRAutoTrimmerApp(tk.Tk):
             fg="#ffffff",
             font=("Segoe UI Semibold", 16, "bold"),
         ).pack(anchor="w")
+        tag_row = tk.Frame(title_box, bg="#1f2937")
+        tag_row.pack(anchor="w", pady=(2, 0))
         tk.Label(
-            title_box,
-            text='Built for developers ❤️ who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
+            tag_row,
+            text="Built for developers",
             bg="#1f2937",
             fg="#cbd5e1",
             font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(side="left")
+        tk.Label(
+            tag_row,
+            text=" ♥ ",
+            bg="#1f2937",
+            fg="#f43f5e",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            tag_row,
+            text='who magically become "video editors" every Friday at 5 PM because the client asked for a quick demo.',
+            bg="#1f2937",
+            fg="#cbd5e1",
+            font=("Segoe UI", 10),
+        ).pack(side="left")
 
         right_hdr = tk.Frame(header, bg="#1f2937")
         right_hdr.pack(side="right", padx=16, pady=8)

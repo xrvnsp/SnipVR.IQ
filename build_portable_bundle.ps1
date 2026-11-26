@@ -61,13 +61,42 @@ $VenvPy = Join-Path $VenvDir "Scripts\python.exe"
 & $VenvPy -m pip install --upgrade pip
 & $VenvPy -m pip install -r (Join-Path $Root "requirements.txt") pyinstaller
 
-Write-Host "=== 3. Building standalone SnipVR.IQ.exe ===" -ForegroundColor Cyan
-& $VenvPy -m PyInstaller --noconfirm --onefile --windowed --name "SnipVR.IQ" `
-    --icon "app_icon.ico" `
-    --add-data "app_icon.ico;." `
-    --add-data "default_model.npz;." `
-    --collect-binaries imageio_ffmpeg `
-    (Join-Path $Root "app.py")
+Write-Host "=== 3. Downloading Google ADB (Platform-Tools) to bundle inside EXE ===" -ForegroundColor Cyan
+$AdbDir = Join-Path $Root "platform_tools"
+$AdbExe = Join-Path $AdbDir "adb.exe"
+if (-not (Test-Path $AdbExe)) {
+    New-Item -ItemType Directory -Force -Path $AdbDir | Out-Null
+    $AdbZip = Join-Path $Root "platform-tools.zip"
+    $AdbTmp = Join-Path $Root "platform_tools_tmp"
+    Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile $AdbZip
+    Expand-Archive -Path $AdbZip -DestinationPath $AdbTmp -Force
+    foreach ($f in @("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")) {
+        $src = Join-Path $AdbTmp "platform-tools\$f"
+        if (Test-Path $src) {
+            Copy-Item $src -Destination (Join-Path $AdbDir $f) -Force
+        }
+    }
+    Remove-Item $AdbZip -Force -ErrorAction SilentlyContinue
+    Remove-Item $AdbTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "=== 4. Building standalone SnipVR.IQ.exe (with FFmpeg + ADB built in) ===" -ForegroundColor Cyan
+$PyInstArgs = @(
+    "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed",
+    "--name", "SnipVR.IQ",
+    "--icon", "app_icon.ico",
+    "--add-data", "app_icon.ico;.",
+    "--add-data", "default_model.npz;.",
+    "--collect-binaries", "imageio_ffmpeg"
+)
+foreach ($f in @("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")) {
+    $fp = Join-Path $AdbDir $f
+    if (Test-Path $fp) {
+        $PyInstArgs += @("--add-binary", "$fp;.")
+    }
+}
+$PyInstArgs += (Join-Path $Root "app.py")
+& $VenvPy @PyInstArgs
 
 Write-Host ""
 Write-Host "Done! Standalone app is ready at: $DistDir\SnipVR.IQ.exe" -ForegroundColor Green

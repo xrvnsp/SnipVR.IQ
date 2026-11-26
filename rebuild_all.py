@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 PUSHER_HTML = ROOT / "Push_To_GitHub_S24_Ultra.html"
 ZIP_OUT = ROOT / "SnipVR.IQ.zip"
 
-EXCLUDE_DIRS = {".venv", "venv", "dist", "build", "python_runtime", "__pycache__", ".git", "ffmpeg_tmp"}
+EXCLUDE_DIRS = {".venv", "venv", "dist", "build", "python_runtime", "__pycache__", ".git", "ffmpeg_tmp", "platform_tools", "platform_tools_tmp"}
 EXCLUDE_FILES = {".DS_Store", "SnipVR.IQ.zip", "VR_Auto_Trimmer_Windows.zip", "passwords.json"}
 EXCLUDE_EXTS = {".pyc", ".pyo"}
 
